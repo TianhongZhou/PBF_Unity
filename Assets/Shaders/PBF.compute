@@ -1,0 +1,352 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ApplyForcePredictPosition
+#pragma kernel ComputeGridHash
+#pragma kernel BuildGridCellStartIndices
+#pragma kernel UpdateVelocityVorticityPosition
+#pragma kernel FindNeighbors
+#pragma kernel ComputeLambda
+#pragma kernel ComputeDeltaP
+#pragma kernel UpdatePredictPosition
+
+#define PI 3.14159265359
+
+struct Particle
+{
+    float3 position;
+    float pad0;
+    float3 velocity;
+    float pad1;
+    float3 predictedPosition;
+    float pad2;
+    float3 deltaP;
+    float pad3;
+    float lambda;
+    float3 pad4;
+    float4 color;
+};
+
+struct Field
+{
+    float4 normal;
+    float distance;
+    int inside;
+    float2 pad;
+};
+
+RWStructuredBuffer<Particle> particles;
+float deltaTime;
+StructuredBuffer<float3> forces;
+uint forceCount;
+RWStructuredBuffer<uint2> gridHash;
+int dimX, dimY, dimZ;
+float3 minBBox, maxBBox;
+float h, rho0, epsilon, c;
+RWStructuredBuffer<int> gridCellStart;
+StructuredBuffer<uint2> sortedHash;
+float particleCount;
+RWStructuredBuffer<uint> neighborIndices;
+RWStructuredBuffer<uint> neighborCounts;
+int maxNeighborCount, res, matrixCount;
+StructuredBuffer<Field> voxels;
+StructuredBuffer<float4x4> worldToLocalMatrices;
+StructuredBuffer<float4x4> localToWorldMatrices;
+float3 minBB, maxBB;
+
+[numthreads(512, 1, 1)]
+void ApplyForcePredictPosition(uint id : SV_DispatchThreadID)
+{
+    Particle p = particles[id];
+    for (uint i = 0; i < forceCount; i++)
+    {
+        p.velocity = p.velocity + forces[i] * deltaTime;
+    }
+    p.predictedPosition = p.position + p.velocity * deltaTime;
+    particles[id] = p;
+}
+
+uint Flatten3D(int x, int y, int z)
+{
+    return x + y * dimX + z * dimX * dimY;
+}
+
+int3 WorldToGrid(float3 pos)
+{
+    int x = clamp((int) ((pos.x - minBBox.x) / h), 0, dimX - 1);
+    int y = clamp((int) ((pos.y - minBBox.y) / h), 0, dimY - 1);
+    int z = clamp((int) ((pos.z - minBBox.z) / h), 0, dimZ - 1);
+    return int3(x, y, z);
+}
+
+[numthreads(512, 1, 1)]
+void ComputeGridHash(uint id : SV_DispatchThreadID)
+{
+    float3 pos = particles[id].predictedPosition;
+    int3 grid = WorldToGrid(pos);
+    uint hash = Flatten3D(grid.x, grid.y, grid.z);
+    gridHash[id] = uint2(hash, id);
+}
+
+[numthreads(512, 1, 1)]
+void BuildGridCellStartIndices(uint id : SV_DispatchThreadID)
+{
+    if (id >= particleCount)
+        return;
+
+    uint2 curr = sortedHash[id];
+    uint currHash = curr.x;
+
+    if (id == 0)
+    {
+        gridCellStart[currHash] = 0;
+    }
+    else
+    {
+        uint2 prev = sortedHash[id - 1];
+        if (prev.x != curr.x)
+        {
+            gridCellStart[currHash] = id;
+        }
+    }
+}
+
+[numthreads(512, 1, 1)]
+void FindNeighbors(uint id : SV_DispatchThreadID)
+{
+    uint count = 0;
+    float3 myPos = particles[id].predictedPosition;
+
+    int3 grid = WorldToGrid(myPos);
+    
+    for (int dx = -1; dx <= 1; dx++)
+        for (int dy = -1; dy <= 1; dy++)
+            for (int dz = -1; dz <= 1; dz++)
+            {
+                int3 neighborGrid = grid + int3(dx, dy, dz);
+                if (neighborGrid.x < 0 || neighborGrid.x >= dimX ||
+                    neighborGrid.y < 0 || neighborGrid.y >= dimY ||
+                    neighborGrid.z < 0 || neighborGrid.z >= dimZ)
+                    continue;
+
+                uint hash = Flatten3D(neighborGrid.x, neighborGrid.y, neighborGrid.z);
+                int start = gridCellStart[hash];
+                if (start == -1)
+                    continue;
+                
+                for (uint i = start; i < particleCount; i++)
+                {
+                    uint2 pair = sortedHash[i];
+                    if (pair.x != hash)
+                        break;
+
+                    uint neighborIdx = pair.y;
+                    if (neighborIdx == id)
+                        continue;
+
+                    float3 neighborPos = particles[neighborIdx].predictedPosition;
+                    if (distance(myPos, neighborPos) < h && count < maxNeighborCount)
+                    {
+                        neighborIndices[id * maxNeighborCount + count] = neighborIdx;
+                        count++;
+                    }
+                }
+            }
+
+    neighborCounts[id] = count;
+}
+
+float Poly6Kernel(float r)
+{
+    if (r < 0 || r > h)
+        return 0.0;
+    return 315.0 / (64.0 * PI * pow(h, 9)) * pow(h * h - r * r, 3);
+}
+
+float3 SpikyKernel(float3 r)
+{
+    float len = length(r);
+    if (len <= 0 || len > h)
+        return float3(0.0, 0.0, 0.0);
+    float coef = -45.0 / (PI * pow(h, 6)) * pow(h - len, 2);
+    return coef * r;
+}
+
+float SpikyKernelGradientCoefficient(float h, float r)
+{
+    return -45.0 / (PI * pow(h, 6)) * pow(h - r, 2);
+}
+
+[numthreads(512, 1, 1)]
+void UpdateVelocityVorticityPosition(uint id : SV_DispatchThreadID)
+{
+    Particle p = particles[id];
+    p.velocity = (p.predictedPosition - p.position) / deltaTime;
+
+    uint neighborCount = neighborCounts[id];
+
+    float3 xsph = float3(0.0, 0.0, 0.0);
+    float3 omega = float3(0.0, 0.0, 0.0);
+
+    float3 gradW;
+    float3 pos_i = p.predictedPosition;
+    float3 vel_i = p.velocity;
+    
+    for (uint i = 0; i < neighborCount; i++)
+    {
+        uint neighborIdx = neighborIndices[id * maxNeighborCount + i];
+        Particle pj = particles[neighborIdx];
+        float3 pos_j = pj.predictedPosition;
+        float3 vel_j = pj.velocity;
+
+        float3 r = pos_i - pos_j;
+        float r_len = length(r);
+
+        if (r_len > 0 && r_len < h)
+        {
+            float coef = SpikyKernelGradientCoefficient(h, r_len);
+            gradW = coef * normalize(r);
+
+            float3 vij = vel_j - vel_i;
+            omega += cross(vij, gradW);
+            
+            xsph += vij * Poly6Kernel(r_len);
+        }
+    }
+    
+    float3 eta = float3(0.0, 0.0, 0.0);
+    for (uint i = 0; i < neighborCount; i++)
+    {
+        uint neighborIdx = neighborIndices[id * maxNeighborCount + i];
+        Particle pj = particles[neighborIdx];
+
+        float3 r = pos_i - pj.predictedPosition;
+        float r_len = length(r);
+
+        if (r_len > 0 && r_len < h)
+        {
+            float coef = SpikyKernelGradientCoefficient(h, r_len);
+            gradW = coef * normalize(r);
+
+            float3 omega_j = float3(0.0, 0.0, 0.0);
+            float3 vij = pj.velocity - vel_i;
+            omega_j = cross(vij, gradW);
+
+            eta += normalize(omega_j) * coef;
+        }
+    }
+
+    float3 N = (length(eta) > 0.00001) ? normalize(eta) : float3(0, 0, 0);
+    float epsilon_vorticity = 0.001;
+    float3 f_vorticity = epsilon_vorticity * cross(N, omega);
+    
+    p.velocity += c * xsph + f_vorticity * deltaTime;
+
+    p.position = p.predictedPosition;
+    particles[id] = p;
+}
+
+[numthreads(512, 1, 1)]
+void ComputeLambda(uint id : SV_DispatchThreadID)
+{
+    Particle pi = particles[id];
+    uint neighborCount = neighborCounts[id];
+    
+    float rhoi = 0.0;
+    float3 grad_i = float3(0.0, 0.0, 0.0);
+    float sum_grad_sq = 0.0;
+    
+    for (uint i = 0; i < neighborCount; i++)
+    {
+        uint neighborIdx = neighborIndices[id * maxNeighborCount + i];
+        Particle pj = particles[neighborIdx];
+        rhoi += Poly6Kernel(length(pi.predictedPosition - pj.predictedPosition));
+        
+        float3 grad_j = SpikyKernel(pi.predictedPosition - pj.predictedPosition) / rho0;
+        sum_grad_sq += dot(grad_j, grad_j);
+        grad_i += grad_j;
+    }
+    
+    float Ci = rhoi / rho0 - 1.0;
+    sum_grad_sq += dot(grad_i, grad_i);
+    
+    pi.lambda = -Ci / (sum_grad_sq + epsilon);
+    particles[id] = pi;
+}
+
+int world2Voxel(float w, float mi, float ma)
+{
+    if (w < mi || w > ma)
+    {
+        return -1;
+    }
+    float result = (w - mi) / (ma - mi) * (res - 1);
+    return (int) result;
+}
+
+[numthreads(512, 1, 1)]
+void ComputeDeltaP(uint id : SV_DispatchThreadID)
+{
+    Particle pi = particles[id];
+    uint neighborCount = neighborCounts[id];
+    float3 sum = float3(0.0, 0.0, 0.0);
+    float deltaq = 0.1 * h;
+    float k = 0.1;
+    float n = 4;
+    
+    for (uint i = 0; i < neighborCount; i++)
+    {
+        uint neighborIdx = neighborIndices[id * maxNeighborCount + i];
+        Particle pj = particles[neighborIdx];
+        
+        float scorr = -k * pow(Poly6Kernel(length(pi.predictedPosition - pj.predictedPosition)) / Poly6Kernel(deltaq), n);
+        sum += (pi.lambda + pj.lambda + scorr) * SpikyKernel(pi.predictedPosition - pj.predictedPosition);
+    }
+    
+    pi.deltaP = sum / rho0;
+    
+    float3 clampedP = pi.predictedPosition + pi.deltaP;
+    clampedP.x = clamp(clampedP.x, minBBox.x, maxBBox.x);
+    clampedP.y = clamp(clampedP.y, minBBox.y, maxBBox.y);
+    clampedP.z = clamp(clampedP.z, minBBox.z, maxBBox.z);
+    
+    float minX = minBB[0];
+    float minY = minBB[1];
+    float minZ = minBB[2];
+    float maxX = maxBB[0];
+    float maxY = maxBB[1];
+    float maxZ = maxBB[2];
+    
+    for (uint i = 0; i < matrixCount; i++)
+    {
+        float3 localClampedP = mul(worldToLocalMatrices[i], float4(clampedP, 1.0)).xyz;
+        
+        int x = world2Voxel(localClampedP.x, minX, maxX);
+        int y = world2Voxel(localClampedP.y, minY, maxY);
+        int z = world2Voxel(localClampedP.z, minZ, maxZ);
+        
+        if (x < 0 || y < 0 || z < 0)
+        {
+            continue;
+        }
+        
+        int idx = x + y * res + z * res * res;
+        
+        
+        if (voxels[idx].inside == 1)
+        {
+            localClampedP += voxels[idx].distance * voxels[idx].normal;
+            clampedP = mul(localToWorldMatrices[i], float4(localClampedP, 1.0)).xyz;
+        }
+    }
+    
+    pi.deltaP = clampedP - pi.predictedPosition;
+    
+    particles[id] = pi;
+}
+
+[numthreads(512, 1, 1)]
+void UpdatePredictPosition(uint id : SV_DispatchThreadID)
+{
+    Particle pi = particles[id];
+    pi.predictedPosition = pi.predictedPosition + pi.deltaP;
+    particles[id] = pi;
+}

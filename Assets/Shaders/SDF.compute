@@ -1,0 +1,190 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel Voxelization
+#pragma kernel ComputeDistance
+
+struct Field
+{
+    float4 normal;
+    float distance;
+    int inside;
+    float2 pad;
+};
+
+struct Triangle
+{
+    float4 v0;
+    float4 v1;
+    float4 v2;
+    float4 v21;
+    float4 v32;
+    float4 v13;
+    float4 nor;
+};
+
+#define INF 1e20
+
+RWStructuredBuffer<Field> voxels;
+StructuredBuffer<Triangle> triangles;
+float3 minBB, maxBB;
+int res, triangleCount;
+
+float edgeFunction(float3 a, float3 b, float2 p)
+{
+    return (p.x - a.y) * (b.z - a.z) - (p.y - a.z) * (b.y - a.y);
+}
+
+int insideTriangleYZ(float3 v0, float3 v1, float3 v2, float y, float z)
+{
+    float2 p = float2(y, z);
+    
+    float w0 = edgeFunction(v0, v1, p);
+    float w1 = edgeFunction(v1, v2, p);
+    float w2 = edgeFunction(v2, v0, p);
+    
+    if ((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))
+    {
+        return 1;
+    }
+    return 0;
+}
+
+float intersectTriangleX(float3 v0, float3 v1, float3 v2, float y, float z)
+{
+    float3 n_ei_yz = cross(v1 - v0, v2 - v0);
+    float d_ei_yz = -dot(n_ei_yz, v0);
+    
+    if (abs(n_ei_yz.x) < 0.0000001)
+    {
+        return INF;
+    }
+    return (-d_ei_yz - n_ei_yz.y * y - n_ei_yz.z * z) / n_ei_yz.x;
+}
+
+float world2Voxel(float w, float mi, float ma)
+{
+    float result = (w - mi) / (ma - mi) * (res - 1);
+    result = max(result, 0);
+    result = min(result, res - 1);
+    return result;
+}
+
+float voxel2World(int v, float min, float max)
+{
+    return min + (v / (float) (res - 1)) * (max - min);
+}
+
+[numthreads(1, 32, 32)]
+void Voxelization(uint3 id : SV_DispatchThreadID)
+{
+    float minX = minBB[0];
+    float minY = minBB[1];
+    float minZ = minBB[2];
+    float maxX = maxBB[0];
+    float maxY = maxBB[1];
+    float maxZ = maxBB[2];
+    
+    float3 deltaP = float3((maxX - minX) / res, (maxY - minY) / res, (maxZ - minZ) / res);
+    
+    int y = id.y;
+    int z = id.z;
+    
+    float vy = voxel2World(y, minY, maxY) + deltaP.y / 2.0;
+    float vz = voxel2World(z, minZ, maxZ) + deltaP.z / 2.0;
+    
+    for (int i = 0; i < triangleCount; i++)
+    {
+        float3 v0 = triangles[i].v0.xyz;
+        float3 v1 = triangles[i].v1.xyz;
+        float3 v2 = triangles[i].v2.xyz;
+        
+        if (insideTriangleYZ(v0, v1, v2, vy, vz) == 0)
+        {
+            continue;
+        }
+        
+        float xIntersect = intersectTriangleX(v0, v1, v2, vy, vz);
+        if (xIntersect == INF)
+        {
+            continue;
+        }
+        
+        int xIntersectVox = (int) world2Voxel(xIntersect, minX, maxX);
+        
+        for (int x = xIntersectVox; x < res; x++)
+        {
+            int idx = x + y * res + z * res * res;
+            voxels[idx].inside ^= 1;
+        }
+    }
+}
+
+float dot2(float3 v)
+{
+    return max(dot(v, v), 1e-6);
+}
+
+[numthreads(8, 8, 8)]
+void ComputeDistance(uint3 id : SV_DispatchThreadID)
+{
+    float minX = minBB[0];
+    float minY = minBB[1];
+    float minZ = minBB[2];
+    float maxX = maxBB[0];
+    float maxY = maxBB[1];
+    float maxZ = maxBB[2];
+    
+    float3 deltaP = float3((maxX - minX) / res, (maxY - minY) / res, (maxZ - minZ) / res);
+    
+    int x = id.x;
+    int y = id.y;
+    int z = id.z;
+    
+    float vx = voxel2World(x, minX, maxX) + deltaP.x / 2.0;
+    float vy = voxel2World(y, minY, maxY) + deltaP.y / 2.0;
+    float vz = voxel2World(z, minZ, maxZ) + deltaP.z / 2.0;
+    float3 p = float3(vx, vy, vz);
+    
+    int idx = x + y * res + z * res * res;
+    Field voxel = voxels[idx];
+    
+    float minDist = INF;
+    float3 bestNormal = float3(1, 0, 0);
+    
+    for (int i = 0; i < triangleCount; i++)
+    {
+        float3 v1 = triangles[i].v0.xyz;
+        float3 v2 = triangles[i].v1.xyz;
+        float3 v3 = triangles[i].v2.xyz;
+        
+        float3 p1 = p - v1;
+        float3 p2 = p - v2;
+        float3 p3 = p - v3;
+        
+        float3 v21 = triangles[i].v21.xyz;
+        float3 v32 = triangles[i].v32.xyz;
+        float3 v13 = triangles[i].v13.xyz;
+        float3 nor = triangles[i].nor.xyz;
+        
+        float distance = sqrt(max(
+                                (sign(dot(cross(v21, nor), p1)) +
+                                 sign(dot(cross(v32, nor), p2)) +
+                                 sign(dot(cross(v13, nor), p3)) < 2.0)
+                                ?
+                                min(min(
+                                dot2(v21 * clamp(dot(v21, p1) / dot2(v21), 0.0, 1.0) - p1),
+                                dot2(v32 * clamp(dot(v32, p2) / dot2(v32), 0.0, 1.0) - p2)),
+                                dot2(v13 * clamp(dot(v13, p3) / dot2(v13), 0.0, 1.0) - p3))
+                                :
+                                dot(nor, p1) * dot(nor, p1) / dot2(nor),
+                                0.0));
+        
+        if (distance < minDist)
+        {
+            minDist = distance;
+            bestNormal = normalize(nor);
+        }
+    }
+    
+    voxels[idx].distance = minDist;
+    voxels[idx].normal = float4(bestNormal, 0.0);
+}
