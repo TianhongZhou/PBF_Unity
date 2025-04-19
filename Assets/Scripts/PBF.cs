@@ -61,9 +61,9 @@ public class PBF : MonoBehaviour
     public bool injectParticles = true;
     public GameObject meshPrefab;
     public ComputeShader renderShader;
-    public bool renderParticles = true;
+    private bool renderParticles = true;
     public Material pointMaterial;
-    public Material waterMaterial;
+    private Material waterMaterial;
 
     private int maxParticleCount = 50000;
     private int currentParticleCount = 0;
@@ -86,6 +86,9 @@ public class PBF : MonoBehaviour
 
     private SDF sdf;
     private Field[] voxels = null;
+
+    private RenderTexture depthRT;
+    private RenderTexture thicknessRT;
 
     void Awake()
     {
@@ -118,6 +121,15 @@ public class PBF : MonoBehaviour
         InitGrid();
 
         sdf = GetComponent<SDF>();
+
+        int w = Screen.width;
+        int h = Screen.height;
+        depthRT = new RenderTexture(w, h, 24, RenderTextureFormat.Depth);
+        thicknessRT = new RenderTexture(w, h, 0, RenderTextureFormat.RHalf);
+
+        voxels = sdf.GetFields();
+        voxelBuffer = new ComputeBuffer(voxels.Length, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Field)));
+        voxelBuffer.SetData(voxels);
     }
 
     void InitGrid()
@@ -187,7 +199,7 @@ public class PBF : MonoBehaviour
             pointMaterial.SetPass(0);
             pointMaterial.SetBuffer("_Particles", particleBuffer);
             Graphics.DrawProceduralNow(MeshTopology.Points, currentParticleCount);
-        }
+        } 
     }
 
     void OnDestroy()
@@ -247,13 +259,6 @@ public class PBF : MonoBehaviour
                 worldToLocalBuffer.SetData(worldToLocalArray);
                 localToWorldBuffer = new ComputeBuffer(localToWorldArray.Count, sizeof(float) * 16);
                 localToWorldBuffer.SetData(localToWorldArray);
-
-                if (voxels == null)
-                {
-                    voxels = sdf.GetFields();
-                    voxelBuffer = new ComputeBuffer(voxels.Length, System.Runtime.InteropServices.Marshal.SizeOf(typeof(Field)));
-                    voxelBuffer.SetData(voxels);
-                }
             }
         }
 

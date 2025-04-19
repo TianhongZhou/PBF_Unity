@@ -272,9 +272,7 @@ MonoBehaviour:
   injectParticles: 0
   meshPrefab: {fileID: 1649085995}
   renderShader: {fileID: 7200000, guid: 0c70893a512a1ef4c88711b8946d0547, type: 3}
-  renderParticles: 1
   pointMaterial: {fileID: 2100000, guid: 6f6791c1b2082094c9102bcbd64fb604, type: 2}
-  waterMaterial: {fileID: 0}
 --- !u!114 &284338785
 MonoBehaviour:
   m_ObjectHideFlags: 0

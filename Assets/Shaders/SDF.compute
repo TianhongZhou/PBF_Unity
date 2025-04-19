@@ -145,7 +145,6 @@ void ComputeDistance(uint3 id : SV_DispatchThreadID)
     float3 p = float3(vx, vy, vz);
     
     int idx = x + y * res + z * res * res;
-    Field voxel = voxels[idx];
     
     float minDist = INF;
     float3 bestNormal = float3(1, 0, 0);
@@ -181,10 +180,10 @@ void ComputeDistance(uint3 id : SV_DispatchThreadID)
         if (distance < minDist)
         {
             minDist = distance;
-            bestNormal = normalize(nor);
+            bestNormal = nor;
         }
     }
     
-    voxels[idx].distance = minDist;
-    voxels[idx].normal = float4(bestNormal, 0.0);
+    //voxels[idx].distance = minDist;
+    //voxels[idx].normal = float4(bestNormal, 0.0);
 }

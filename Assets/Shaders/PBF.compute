@@ -330,12 +330,27 @@ void ComputeDeltaP(uint id : SV_DispatchThreadID)
         
         int idx = x + y * res + z * res * res;
         
-        
-        if (voxels[idx].inside == 1)
+        float3 localPredictedP = mul(worldToLocalMatrices[i], float4(pi.predictedPosition, 1.0)).xyz;
+        int maxSteps = 32;
+        int step = 0;
+        while (voxels[idx].inside == 1 && step++ < maxSteps)
         {
-            localClampedP += voxels[idx].distance * voxels[idx].normal;
-            clampedP = mul(localToWorldMatrices[i], float4(localClampedP, 1.0)).xyz;
+            //localClampedP += voxels[idx].distance * normalize(voxels[idx].normal);
+            float3 dir = localPredictedP - localClampedP;
+            localClampedP += 0.1 * dir;
+            
+            int x = world2Voxel(localClampedP.x, minX, maxX);
+            int y = world2Voxel(localClampedP.y, minY, maxY);
+            int z = world2Voxel(localClampedP.z, minZ, maxZ);
+        
+            if (x < 0 || y < 0 || z < 0)
+            {
+                continue;
+            }
+        
+            idx = x + y * res + z * res * res;
         }
+        clampedP = mul(localToWorldMatrices[i], float4(localClampedP, 1.0)).xyz;
     }
     
     pi.deltaP = clampedP - pi.predictedPosition;

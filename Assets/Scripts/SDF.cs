@@ -54,7 +54,7 @@ public class SDF : MonoBehaviour
         GetTriangleBuffer();
 
         DispatchVoxelization();
-        DispatchDistanceComputing();
+        //DispatchDistanceComputing();
 
         voxels = new Field[resolution * resolution * resolution];
         voxelBuffer.GetData(voxels);
@@ -71,6 +71,11 @@ public class SDF : MonoBehaviour
         Vector3[] vertices = mesh.vertices;
         int[] triangles = mesh.triangles;
 
+        bool HasBadFloat(Vector3 v) =>
+        float.IsNaN(v.x) || float.IsInfinity(v.x) ||
+        float.IsNaN(v.y) || float.IsInfinity(v.y) ||
+        float.IsNaN(v.z) || float.IsInfinity(v.z);
+
         List<Triangle> triList = new List<Triangle>();
         for (int i = 0; i < triangles.Length / 3; i++)
         {
@@ -81,6 +86,7 @@ public class SDF : MonoBehaviour
             Vector3 v0 = vertices[i0];
             Vector3 v1 = vertices[i1];
             Vector3 v2 = vertices[i2];
+
             Vector3 normal = Vector3.Cross(v1 - v0, v0 - v2);
             if (normal.normalized.sqrMagnitude < 1e-6f)
             {
